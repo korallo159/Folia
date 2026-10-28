@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: korszulak1 <306864791+korszulak1@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 12:04:17 +0100
+Subject: [PATCH] Register every chunk holder with its tick region.
+
+A load for a chunk with no region never sees a tick thread, so it
+requeues itself through the global queue and the region tick never returns.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+
+diff --git a/ca/spottedleaf/moonrise/paper/util/BaseChunkSystemHooks.java b/ca/spottedleaf/moonrise/paper/util/BaseChunkSystemHooks.java
+index e7b15d1b816f855df4cd955e4e1962725b0d1c91..52dcbcf64c3a510d4a4524b7d0ee226d9a73511d 100644
+--- a/ca/spottedleaf/moonrise/paper/util/BaseChunkSystemHooks.java
++++ b/ca/spottedleaf/moonrise/paper/util/BaseChunkSystemHooks.java
+@@ -75,14 +75,16 @@ public abstract class BaseChunkSystemHooks implements ca.spottedleaf.moonrise.co
+ 
+     @Override
+     public void onChunkHolderCreate(final ServerLevel level, final ChunkHolder holder) {
+-        // Minez - do not regionise every holder. NewChunkHolder.updateTicketLevel adds the
+-        // chunk once its ticket reaches full load, so the generation halo stays off the player region.
++        // Folia start - threaded regions
++        level.regioniser.addChunk(holder.getPos().x(), holder.getPos().z());
++        // Folia end - threaded regions
+     }
+ 
+     @Override
+     public void onChunkHolderDelete(final ServerLevel level, final ChunkHolder holder) {
+-        // Minez - only chunks that joined a tick region are removed. Halo holders never called addChunk.
+-        ((ca.spottedleaf.moonrise.patches.chunk_system.level.chunk.ChunkSystemChunkHolder)holder).moonrise$getRealChunkHolder().minez$leaveTickRegion();
++        // Folia start - threaded regions
++        level.regioniser.removeChunk(holder.getPos().x(), holder.getPos().z());
++        // Folia end - threaded regions
+     }
+ 
+     @Override
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
+index 54d15d1046f207d517fd44683956fb76116e1ae2..24c8581b2fa9c3ef6f6aad64bd4454d64fe233ae 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
+@@ -640,8 +640,6 @@ public final class NewChunkHolder {
+     // ticket level state
+     private int oldTicketLevel = ChunkHolderManager.MAX_TICKET_LEVEL + 1;
+     private int currentTicketLevel = ChunkHolderManager.MAX_TICKET_LEVEL + 1;
+-    // Minez - true after this chunk has been added to the tick regioniser
+-    private boolean minezInTickRegion;
+ 
+     public int getTicketLevel() {
+         return this.currentTicketLevel;
+@@ -672,20 +670,6 @@ public final class NewChunkHolder {
+ 
+     void updateTicketLevel(final int toLevel) {
+         this.currentTicketLevel = toLevel;
+-        // Minez - full-load tickets and better (lower) own a tick-region section.
+-        // Holders kept only for worldgen stay out, so player regions stay the view-distance square.
+-        if (!this.minezInTickRegion && toLevel <= ChunkHolderManager.FULL_LOADED_TICKET_LEVEL) {
+-            this.world.regioniser.addChunk(this.chunkX, this.chunkZ);
+-            this.minezInTickRegion = true;
+-        }
+-    }
+-
+-    public void minez$leaveTickRegion() {
+-        if (!this.minezInTickRegion) {
+-            return;
+-        }
+-        this.minezInTickRegion = false;
+-        this.world.regioniser.removeChunk(this.chunkX, this.chunkZ);
+     }
+ 
+     private int totalNeighboursUsingThisChunk = 0;
+diff --git a/io/papermc/paper/threadedregions/RegionizedTaskQueue.java b/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
+index 93df2341301ee1ddcf95d16c47669e95fbc07c64..d1a045d47dcd12f246d95ecdfc202da357897cbf 100644
+--- a/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
++++ b/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
+@@ -624,25 +624,13 @@ public final class RegionizedTaskQueue {
+                             continue;
+                         }
+                         // may have been cancelled before we got to the queue
+-                        if (this.getReferenceCounterVolatile() == null) {
+-                            // the task never could be polled from the queue, so we return false
+-                            // don't decrement reference count, as we were certainly cancelled by another thread, which
+-                            // will decrement the reference count
+-                            return false;
++                        if (this.getReferenceCounterVolatile() != null) {
++                            throw new IllegalStateException("Expected null ref count when queue does not exist");
+                         }
+-                        // Minez - no tick region owns this chunk (generation halo). The global region runs the task.
+-                        if (this.compareAndExchangeReferenceCounter(referenceCounter, null) != referenceCounter) {
+-                            return false;
+-                        }
+-                        final ReferenceCountData heldReference = referenceCounter;
+-                        this.world.pushGlobalChunkTask(() -> {
+-                            try {
+-                                ChunkBasedPriorityTask.this.executeInternal();
+-                            } finally {
+-                                ChunkBasedPriorityTask.this.world.decrementReference(heldReference, ChunkBasedPriorityTask.this.sectionLowerLeftCoord);
+-                            }
+-                        });
+-                        return true;
++                        // the task never could be polled from the queue, so we return false
++                        // don't decrement reference count, as we were certainly cancelled by another thread, which
++                        // will decrement the reference count
++                        return false;
+                     }
+ 
+                     synchronise = true;
