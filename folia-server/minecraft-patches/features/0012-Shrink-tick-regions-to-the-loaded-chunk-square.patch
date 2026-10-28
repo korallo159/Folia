@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: korszulak1 <306864791+korszulak1@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 11:48:48 +0100
+Subject: [PATCH] Shrink tick regions to the loaded chunk square
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+
+diff --git a/ca/spottedleaf/moonrise/paper/util/BaseChunkSystemHooks.java b/ca/spottedleaf/moonrise/paper/util/BaseChunkSystemHooks.java
+index 52dcbcf64c3a510d4a4524b7d0ee226d9a73511d..e7b15d1b816f855df4cd955e4e1962725b0d1c91 100644
+--- a/ca/spottedleaf/moonrise/paper/util/BaseChunkSystemHooks.java
++++ b/ca/spottedleaf/moonrise/paper/util/BaseChunkSystemHooks.java
+@@ -75,16 +75,14 @@ public abstract class BaseChunkSystemHooks implements ca.spottedleaf.moonrise.co
+ 
+     @Override
+     public void onChunkHolderCreate(final ServerLevel level, final ChunkHolder holder) {
+-        // Folia start - threaded regions
+-        level.regioniser.addChunk(holder.getPos().x(), holder.getPos().z());
+-        // Folia end - threaded regions
++        // Minez - do not regionise every holder. NewChunkHolder.updateTicketLevel adds the
++        // chunk once its ticket reaches full load, so the generation halo stays off the player region.
+     }
+ 
+     @Override
+     public void onChunkHolderDelete(final ServerLevel level, final ChunkHolder holder) {
+-        // Folia start - threaded regions
+-        level.regioniser.removeChunk(holder.getPos().x(), holder.getPos().z());
+-        // Folia end - threaded regions
++        // Minez - only chunks that joined a tick region are removed. Halo holders never called addChunk.
++        ((ca.spottedleaf.moonrise.patches.chunk_system.level.chunk.ChunkSystemChunkHolder)holder).moonrise$getRealChunkHolder().minez$leaveTickRegion();
+     }
+ 
+     @Override
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
+index 24c8581b2fa9c3ef6f6aad64bd4454d64fe233ae..54d15d1046f207d517fd44683956fb76116e1ae2 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder.java
+@@ -640,6 +640,8 @@ public final class NewChunkHolder {
+     // ticket level state
+     private int oldTicketLevel = ChunkHolderManager.MAX_TICKET_LEVEL + 1;
+     private int currentTicketLevel = ChunkHolderManager.MAX_TICKET_LEVEL + 1;
++    // Minez - true after this chunk has been added to the tick regioniser
++    private boolean minezInTickRegion;
+ 
+     public int getTicketLevel() {
+         return this.currentTicketLevel;
+@@ -670,6 +672,20 @@ public final class NewChunkHolder {
+ 
+     void updateTicketLevel(final int toLevel) {
+         this.currentTicketLevel = toLevel;
++        // Minez - full-load tickets and better (lower) own a tick-region section.
++        // Holders kept only for worldgen stay out, so player regions stay the view-distance square.
++        if (!this.minezInTickRegion && toLevel <= ChunkHolderManager.FULL_LOADED_TICKET_LEVEL) {
++            this.world.regioniser.addChunk(this.chunkX, this.chunkZ);
++            this.minezInTickRegion = true;
++        }
++    }
++
++    public void minez$leaveTickRegion() {
++        if (!this.minezInTickRegion) {
++            return;
++        }
++        this.minezInTickRegion = false;
++        this.world.regioniser.removeChunk(this.chunkX, this.chunkZ);
+     }
+ 
+     private int totalNeighboursUsingThisChunk = 0;
+diff --git a/io/papermc/paper/threadedregions/RegionizedTaskQueue.java b/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
+index d1a045d47dcd12f246d95ecdfc202da357897cbf..93df2341301ee1ddcf95d16c47669e95fbc07c64 100644
+--- a/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
++++ b/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
+@@ -624,13 +624,25 @@ public final class RegionizedTaskQueue {
+                             continue;
+                         }
+                         // may have been cancelled before we got to the queue
+-                        if (this.getReferenceCounterVolatile() != null) {
+-                            throw new IllegalStateException("Expected null ref count when queue does not exist");
++                        if (this.getReferenceCounterVolatile() == null) {
++                            // the task never could be polled from the queue, so we return false
++                            // don't decrement reference count, as we were certainly cancelled by another thread, which
++                            // will decrement the reference count
++                            return false;
+                         }
+-                        // the task never could be polled from the queue, so we return false
+-                        // don't decrement reference count, as we were certainly cancelled by another thread, which
+-                        // will decrement the reference count
+-                        return false;
++                        // Minez - no tick region owns this chunk (generation halo). The global region runs the task.
++                        if (this.compareAndExchangeReferenceCounter(referenceCounter, null) != referenceCounter) {
++                            return false;
++                        }
++                        final ReferenceCountData heldReference = referenceCounter;
++                        this.world.pushGlobalChunkTask(() -> {
++                            try {
++                                ChunkBasedPriorityTask.this.executeInternal();
++                            } finally {
++                                ChunkBasedPriorityTask.this.world.decrementReference(heldReference, ChunkBasedPriorityTask.this.sectionLowerLeftCoord);
++                            }
++                        });
++                        return true;
+                     }
+ 
+                     synchronise = true;
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 35ab432bbd59aba80a6eaca1769e6aa82c8a7e46..0419fd00243e6925c021a6304e515547b58c22b0 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -709,10 +709,12 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     public final io.papermc.paper.threadedregions.TickRegions tickRegions = new io.papermc.paper.threadedregions.TickRegions();
+     public final io.papermc.paper.threadedregions.ThreadedRegionizer<io.papermc.paper.threadedregions.TickRegions.TickRegionData, io.papermc.paper.threadedregions.TickRegions.TickRegionSectionData> regioniser;
+     {
++        // Minez - one chunk of ownership around a ticking chunk, instead of eight.
++        // The same constant feeds the dead-section purge area.
+         this.regioniser = new io.papermc.paper.threadedregions.ThreadedRegionizer<>(
+-                (int)Math.max(1L, (8L * 16L * 16L) / (1L << (2 * (io.papermc.paper.threadedregions.TickRegions.getRegionChunkShift())))),
++                (int)Math.max(1L, (1L * 16L * 16L) / (1L << (2 * (io.papermc.paper.threadedregions.TickRegions.getRegionChunkShift())))),
+                 (1.0 / 6.0),
+-                Math.max(1, 8 / (1 << io.papermc.paper.threadedregions.TickRegions.getRegionChunkShift())),
++                Math.max(1, 1 / (1 << io.papermc.paper.threadedregions.TickRegions.getRegionChunkShift())),
+                 1,
+                 io.papermc.paper.threadedregions.TickRegions.getRegionChunkShift(),
+                 this,
